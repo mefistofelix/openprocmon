@@ -573,6 +573,13 @@ mod tests {
         let detail = ev.detail();
         assert!(detail.contains("PID: 1234"), "detail: {detail}");
         assert!(detail.contains("notepad.exe foo.txt"), "detail: {detail}");
+        assert_eq!(ev.process_subject_pid(), 1234);
+        assert_eq!(ev.process_subject_parent_pid(), Some(4));
+        assert_eq!(ev.process_subject_image_path().as_deref(), Some(image));
+        assert_eq!(
+            ev.process_subject_command_line().as_deref(),
+            Some("notepad.exe foo.txt")
+        );
 
         // The process table now knows process seq 5 / pid 1234.
         assert!(mgr.by_seq(5).is_some());
@@ -695,5 +702,11 @@ mod tests {
             ev.detail(),
             "Parent PID: 100, Command line: a.exe -x, Current directory: C:\\Dir"
         );
+        assert_eq!(ev.process_subject_parent_pid(), Some(100));
+        assert_eq!(
+            ev.process_subject_command_line().as_deref(),
+            Some("a.exe -x")
+        );
+        assert_eq!(ev.process_working_directory().as_deref(), Some("C:\\Dir"));
     }
 }

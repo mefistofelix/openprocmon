@@ -10,7 +10,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crossbeam_channel::Receiver;
 use procmon_core::CaptureOutcome;
+use procmon_sdk::Event;
 
 use crate::ipc::{read_msg, write_msg, ChildMsg, ParentMsg};
 
@@ -34,6 +36,7 @@ pub fn run_worker<R, W>(
     capturer: Box<dyn Capturer>,
     reader: R,
     writer: &mut W,
+    events: Option<&Receiver<Event>>,
 ) -> std::io::Result<CaptureOutcome>
 where
     R: BufRead + Send + 'static,
@@ -59,12 +62,22 @@ where
         flag.store(true, Ordering::SeqCst);
     });
 
-    // Wait for the capture to self-stop (duration/size) or the parent to signal.
+    // Wait for the capture to self-stop (duration/size) or the parent to signal,
+    // forwarding accepted events as soon as the capture thread publishes them.
     while capturer.is_running() && !signalled.load(Ordering::SeqCst) {
-        std::thread::sleep(Duration::from_millis(100));
+        if forward_events(events, writer).is_err() {
+            // The parent side disappeared. Finalize the PML instead of leaving
+            // the driver/session alive just because live forwarding failed.
+            signalled.store(true, Ordering::SeqCst);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
     }
 
     let outcome = capturer.stop()?;
+    // stop() joins the capture thread, so this final drain contains every event
+    // that raced with the last polling iteration.
+    let _ = forward_events(events, writer);
     // Best-effort: if the parent died the pipe write fails, but the PML is saved.
     let _ = write_msg(
         writer,
@@ -75,6 +88,24 @@ where
         },
     );
     Ok(outcome)
+}
+
+fn forward_events<W: Write>(
+    events: Option<&Receiver<Event>>,
+    writer: &mut W,
+) -> std::io::Result<()> {
+    let Some(events) = events else {
+        return Ok(());
+    };
+    while let Ok(ev) = events.try_recv() {
+        write_msg(
+            writer,
+            &ChildMsg::Event {
+                line: crate::stream::format_event(&ev),
+            },
+        )?;
+    }
+    Ok(())
 }
 
 impl Capturer for procmon_core::CaptureSession {
@@ -133,7 +164,7 @@ mod tests {
         // Parent sends a Stop line; capture is "running" until the signal.
         let reader = Cursor::new(b"{\"type\":\"stop\"}\n".to_vec());
         let mut out: Vec<u8> = Vec::new();
-        let outcome = run_worker(cap, reader, &mut out).unwrap();
+        let outcome = run_worker(cap, reader, &mut out, None).unwrap();
         assert_eq!(outcome.events_written, 7);
         assert!(stopped.load(Ordering::SeqCst), "capturer was stopped");
         let text = String::from_utf8(out).unwrap();
@@ -147,7 +178,7 @@ mod tests {
         // Empty input == immediate EOF (parent exited before sending anything).
         let reader = Cursor::new(Vec::new());
         let mut out: Vec<u8> = Vec::new();
-        let outcome = run_worker(cap, reader, &mut out).unwrap();
+        let outcome = run_worker(cap, reader, &mut out, None).unwrap();
         assert!(
             stopped.load(Ordering::SeqCst),
             "EOF still finalizes the PML"
@@ -162,7 +193,7 @@ mod tests {
         let (cap, stopped) = fake(false);
         let reader = Cursor::new(Vec::new());
         let mut out: Vec<u8> = Vec::new();
-        run_worker(cap, reader, &mut out).unwrap();
+        run_worker(cap, reader, &mut out, None).unwrap();
         assert!(stopped.load(Ordering::SeqCst), "self-stop still finalizes");
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("\"type\":\"done\""));

@@ -40,6 +40,8 @@
 /kernel/x64
 /.claude
 /target
+/.toolchain
+/.toolchain.lock
 
 # Brainstorming / planning artifacts (local only)
 /docs/superpowers/

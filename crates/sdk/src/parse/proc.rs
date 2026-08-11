@@ -347,20 +347,38 @@ impl OperationView for ProcView<'_> {
     }
 }
 
-/// Detail for `NOTIFY_PROCESS_START`: parent PID plus the command line and current
-/// directory that trail the fixed struct (the environment block is skipped). The
-/// string lengths are mode-dependent (PML packs ASCII strings 1 byte/char).
-fn start_detail(data: &[u8], mode: DetailMode, sep: &str) -> String {
-    let Some(info) = cast::<LogProcessStart>(data) else {
-        return String::new();
-    };
+/// Fields carried directly by `NOTIFY_PROCESS_START` after the fixed header.
+pub(crate) struct ProcessStartInfo {
+    pub parent_pid: u32,
+    pub command_line: String,
+    pub current_directory: String,
+}
+
+/// Parses the command line and current directory captured in a Process Start
+/// record. These are the values read from the new process's PEB by the driver,
+/// so callers do not have to infer them from the process-table snapshot.
+pub(crate) fn start_info(data: &[u8], mode: DetailMode) -> Option<ProcessStartInfo> {
+    let info = cast::<LogProcessStart>(data)?;
     let fixed = size_of::<LogProcessStart>();
     let (cmd, cmd_bytes) = read_detail_str(data, fixed, info.command_line_length, mode);
     let (cwd, _) = read_detail_str(data, fixed + cmd_bytes, info.current_directory_length, mode);
+    Some(ProcessStartInfo {
+        parent_pid: info.parent_id,
+        command_line: cmd,
+        current_directory: cwd,
+    })
+}
+
+/// Detail for `NOTIFY_PROCESS_START`: parent PID plus the command line and current
+/// directory that trail the fixed struct (the environment block is skipped).
+fn start_detail(data: &[u8], mode: DetailMode, sep: &str) -> String {
+    let Some(info) = start_info(data, mode) else {
+        return String::new();
+    };
     [
-        format!("Parent PID: {}", { info.parent_id }),
-        format!("Command line: {cmd}"),
-        format!("Current directory: {cwd}"),
+        format!("Parent PID: {}", info.parent_pid),
+        format!("Command line: {}", info.command_line),
+        format!("Current directory: {}", info.current_directory),
     ]
     .join(sep)
 }

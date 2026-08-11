@@ -11,6 +11,7 @@
 //! duration limit and need no message).
 
 use std::io::BufReader;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
 use interprocess::local_socket::{
@@ -28,7 +29,7 @@ pub fn pipe_name(seq: u64) -> String {
 /// halves, plus the child handle.
 pub struct WorkerLink {
     pub reader: BufReader<RecvHalf>,
-    pub writer: SendHalf,
+    writer: Arc<Mutex<SendHalf>>,
     // Held only to keep the elevated process handle open until the link drops
     // (RAII close). Completion is detected over the pipe, never by waiting on it.
     #[cfg(windows)]
@@ -36,21 +37,50 @@ pub struct WorkerLink {
     pub child: crate::elevate::ElevatedChild,
 }
 
+/// Cloneable control handle safe to use from the Ctrl-C handler while the main
+/// thread blocks reading live events from the worker.
+#[derive(Clone)]
+pub struct WorkerStopper {
+    writer: Arc<Mutex<SendHalf>>,
+}
+
+impl WorkerStopper {
+    pub fn send_stop(&self) -> std::io::Result<()> {
+        let mut writer = self
+            .writer
+            .lock()
+            .map_err(|_| std::io::Error::other("worker pipe writer lock poisoned"))?;
+        write_msg(&mut *writer, &ParentMsg::Stop)
+    }
+}
+
 #[cfg(windows)]
 impl WorkerLink {
+    /// Reads the next worker message, including live event rows.
+    pub fn read_next(&mut self) -> Result<Option<ChildMsg>> {
+        read_msg::<ChildMsg, _>(&mut self.reader).map_err(Into::into)
+    }
+
     /// Reads the worker's first `Started{pml_path}` message (sent right after it
     /// connects, while it is still alive — so this read does not block on a dead
     /// peer). Returns the PML path it reported, or `None` if the stream closed.
     pub fn read_started(&mut self) -> Result<Option<String>> {
-        match read_msg::<ChildMsg, _>(&mut self.reader)? {
+        match self.read_next()? {
             Some(ChildMsg::Started { pml_path }) => Ok(Some(pml_path)),
             _ => Ok(None),
         }
     }
 
     /// Signals the worker to stop and finalize (background `stop_capture`).
-    pub fn send_stop(&mut self) -> std::io::Result<()> {
-        write_msg(&mut self.writer, &ParentMsg::Stop)
+    pub fn send_stop(&self) -> std::io::Result<()> {
+        self.stopper().send_stop()
+    }
+
+    /// A control handle that can stop this worker from another thread.
+    pub fn stopper(&self) -> WorkerStopper {
+        WorkerStopper {
+            writer: Arc::clone(&self.writer),
+        }
     }
 
     /// Reads until the worker's terminal `Done` message (its result) or a clean
@@ -63,7 +93,7 @@ impl WorkerLink {
     /// elevated child, so the pipe is the source of truth for completion.
     pub fn read_done(&mut self) -> Result<Option<(u64, String, String)>> {
         loop {
-            match read_msg::<ChildMsg, _>(&mut self.reader)? {
+            match self.read_next()? {
                 Some(ChildMsg::Done {
                     events_written,
                     stopped_reason,
@@ -105,7 +135,7 @@ pub fn launch_worker(name: &str, mut worker_args: Vec<String>) -> Result<WorkerL
     let (rh, sh) = conn.split();
     Ok(WorkerLink {
         reader: BufReader::new(rh),
-        writer: sh,
+        writer: Arc::new(Mutex::new(sh)),
         child,
     })
 }

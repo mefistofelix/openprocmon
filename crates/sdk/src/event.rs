@@ -594,6 +594,101 @@ impl Event {
         }
     }
 
+    /// PID of the process described by a lifecycle event. A live `Process Create`
+    /// row is attributed to the parent process in the common event header, while
+    /// its payload describes the child; this accessor returns the child PID in
+    /// that case and the normal event PID otherwise.
+    pub fn process_subject_pid(&self) -> u32 {
+        if self.class() == EventClass::Process
+            && self.notify_type() == crate::kernel_types::proc_notify::CREATE
+        {
+            return crate::parse::proc::create_info(self.pre_data(), self.mode())
+                .map(|i| i.pid)
+                .unwrap_or_else(|| self.pid());
+        }
+        self.pid()
+    }
+
+    /// Parent PID of the process described by a lifecycle event. Process Create
+    /// and Process Start carry the child's real parent directly in their payload;
+    /// other events fall back to the attached process-table record.
+    pub fn process_subject_parent_pid(&self) -> Option<u32> {
+        if self.class() == EventClass::Process {
+            match self.notify_type() {
+                crate::kernel_types::proc_notify::CREATE => {
+                    return crate::parse::proc::create_info(self.pre_data(), self.mode())
+                        .map(|i| i.parent_pid);
+                }
+                crate::kernel_types::proc_notify::START => {
+                    return crate::parse::proc::start_info(self.pre_data(), self.mode())
+                        .map(|i| i.parent_pid);
+                }
+                _ => {}
+            }
+        }
+        self.parent_pid()
+    }
+
+    /// Executable path of the process described by the event. For `Process
+    /// Create` this comes from the child payload rather than the parent process
+    /// attached to the common event header.
+    pub fn process_subject_image_path(&self) -> Option<String> {
+        if self.class() == EventClass::Process
+            && self.notify_type() == crate::kernel_types::proc_notify::CREATE
+        {
+            return crate::parse::proc::create_info(self.pre_data(), self.mode())
+                .map(|i| i.image_path)
+                .filter(|p| !p.is_empty());
+        }
+        self.image_path()
+            .filter(|p| !p.is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                (self.class() == EventClass::Process)
+                    .then(|| self.path())
+                    .flatten()
+            })
+    }
+
+    /// Full command line of the process described by the event. Process Start
+    /// prefers the command line carried by that event's own payload; Process
+    /// Create uses the child payload; other events use the process table.
+    pub fn process_subject_command_line(&self) -> Option<String> {
+        if self.class() == EventClass::Process {
+            match self.notify_type() {
+                crate::kernel_types::proc_notify::CREATE => {
+                    let cmd =
+                        crate::parse::proc::create_info(self.pre_data(), self.mode())?.command_line;
+                    return (!cmd.is_empty()).then_some(cmd);
+                }
+                crate::kernel_types::proc_notify::START => {
+                    if let Some(info) = crate::parse::proc::start_info(self.pre_data(), self.mode())
+                    {
+                        if !info.command_line.is_empty() {
+                            return Some(info.command_line);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.command_line()
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    }
+
+    /// Working directory captured with a Process Start event, if present.
+    pub fn process_working_directory(&self) -> Option<String> {
+        if self.class() != EventClass::Process
+            || self.notify_type() != crate::kernel_types::proc_notify::START
+        {
+            return None;
+        }
+        crate::parse::proc::start_info(self.pre_data(), self.mode())
+            .map(|i| i.current_directory)
+            .filter(|p| !p.is_empty())
+    }
+
     /// Image company name (`emCompany`); for live, `None` until the metadata
     /// worker fills it; for PML, from the capture's process table.
     pub fn company(&self) -> Option<&str> {

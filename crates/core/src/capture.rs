@@ -125,7 +125,31 @@ impl CaptureSession {
         limits: CaptureLimits,
         out_path: impl Into<PathBuf>,
     ) -> Result<Self> {
-        let out_path = out_path.into();
+        Self::start_inner(loader, spec, limits, out_path.into(), None)
+    }
+
+    /// Starts a capture and returns a receiver that yields every scoped,
+    /// filtered event immediately after it is accepted by the PML writer.
+    /// Consumers can render or forward the events without waiting for capture
+    /// finalization; dropping the receiver does not stop the capture.
+    pub fn start_streaming(
+        loader: DriverLoader,
+        spec: TargetSpec,
+        limits: CaptureLimits,
+        out_path: impl Into<PathBuf>,
+    ) -> Result<(Self, crossbeam_channel::Receiver<Event>)> {
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        let session = Self::start_inner(loader, spec, limits, out_path.into(), Some(event_tx))?;
+        Ok((session, event_rx))
+    }
+
+    fn start_inner(
+        loader: DriverLoader,
+        spec: TargetSpec,
+        limits: CaptureLimits,
+        out_path: PathBuf,
+        event_tx: Option<crossbeam_channel::Sender<Event>>,
+    ) -> Result<Self> {
         let mut controller = MonitorController::connect_with_driver(loader)?;
         if spec.monitors.contains(MonitorFlags::NETWORK) {
             controller.set_resolve_addresses(true);
@@ -168,6 +192,7 @@ impl CaptureSession {
                     limits,
                     thread_stop,
                     thread_out,
+                    event_tx,
                 )
             })
             .map_err(|e| procmon_sdk::Error::Parse(format!("spawn capture thread: {e}")))?;
@@ -222,8 +247,8 @@ impl Drop for CaptureSession {
 }
 
 /// One-shot capture: start, run until a limit (or stop), finalize, return.
-/// `limits.duration` (or `max_bytes`) bounds it; with neither it would run
-/// until the channel disconnects, so callers set at least one.
+/// With no practical size/duration limit it runs until explicitly stopped or
+/// until the driver channel disconnects.
 pub fn capture(
     loader: DriverLoader,
     spec: TargetSpec,
@@ -259,6 +284,7 @@ fn run_capture(
     limits: CaptureLimits,
     stop: Arc<AtomicBool>,
     out_path: PathBuf,
+    event_tx: Option<crossbeam_channel::Sender<Event>>,
 ) -> Result<CaptureOutcome> {
     let own_pid = std::process::id();
     let mut writer = PmlWriter::new(cfg!(target_pointer_width = "64"));
@@ -296,8 +322,15 @@ fn run_capture(
                     && scope.contains(&ev)
                     && filter.as_ref().is_none_or(|f| f.matches(&ev))
                 {
+                    let event_bytes = ev.byte_size();
                     writer.push_event(&ev);
-                    bytes += ev.byte_size();
+                    if let Some(tx) = &event_tx {
+                        // An unbounded channel keeps stdout/IPC backpressure off
+                        // the driver ingest thread. If the consumer disappeared,
+                        // capture and PML writing continue normally.
+                        let _ = tx.send(ev);
+                    }
+                    bytes = bytes.saturating_add(event_bytes);
                     written += 1;
                 }
             }

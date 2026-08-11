@@ -1,12 +1,15 @@
 //! `procmon-cli`: the command-line + MCP front-end for OpenProcMon.
 //!
-//! A capture-then-analyze tool: `capture` writes a Procmon-compatible `.PML`
-//! (live, needs Administrator + driver); every other command reads a `.PML` and
-//! prints JSON — the same shape the MCP tools return. The one filter vocabulary
-//! (`vocab`) drives both the capture filter and the analysis queries.
+//! A capture-then-analyze tool: `capture` streams accepted events while writing
+//! a Procmon-compatible `.PML` (live, needs Administrator + driver); every other
+//! command reads a `.PML` and prints JSON — the same shape the MCP tools return.
+//! The one filter vocabulary (`vocab`) drives both capture and analysis queries.
 
+use std::io::BufRead;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -18,6 +21,7 @@ mod ipc;
 mod loader;
 mod mcp;
 mod orchestrate;
+mod stream;
 mod worker;
 
 #[derive(Parser)]
@@ -31,7 +35,7 @@ struct Cli {
 enum Command {
     /// Capture activity to a .PML (live; needs Administrator). Targets are by
     /// process name (+ children) and/or pid; an optional command is launched
-    /// first. Prints the outcome plus a summary and a sample of events.
+    /// first. Streams one minimal tab-separated line per event until Ctrl-C.
     Capture {
         /// Target process name (repeatable). Empty = capture the whole system.
         #[arg(long = "name")]
@@ -52,12 +56,12 @@ enum Command {
             default_value = "process,file,registry,network"
         )]
         monitor: Vec<String>,
-        /// Capture for at most this many seconds.
-        #[arg(long, default_value_t = 10)]
-        duration: u64,
-        /// Stop once this many MiB have been captured.
-        #[arg(long = "max-mb", default_value_t = 512)]
-        max_mb: usize,
+        /// Optional maximum capture duration in seconds. Omit to run until Ctrl-C.
+        #[arg(long)]
+        duration: Option<u64>,
+        /// Optional capture size limit in MiB. Omit for no automatic size stop.
+        #[arg(long = "max-mb")]
+        max_mb: Option<usize>,
         /// Capture-time filter expression, e.g. 'Operation == WriteFile'
         /// (&& / || / ! / in (...)). See `vocab`.
         #[arg(long = "filter")]
@@ -65,9 +69,19 @@ enum Command {
         /// Output .PML path (default: a temp file).
         #[arg(long)]
         out: Option<PathBuf>,
-        /// Number of sample events to include in the output.
+        /// Number of sample events to include with --json.
         #[arg(long, default_value_t = 100)]
         sample: usize,
+        /// Suppress live rows and print the original final JSON summary.
+        #[arg(long)]
+        json: bool,
+        /// Stop cleanly when stdin receives `stop` or reaches EOF (for Node and
+        /// other process supervisors; Windows SIGTERM is forceful).
+        #[arg(long = "stop-stdin")]
+        stop_stdin: bool,
+        /// Internal: forward live rows from an elevated worker to its parent.
+        #[arg(long, hide = true)]
+        stream: bool,
         /// Internal: when set, run as the elevated capture worker driven over
         /// this pipe by an unelevated parent. Not for direct use.
         #[arg(long = "control-pipe", hide = true)]
@@ -225,6 +239,9 @@ fn run() -> Result<()> {
             filter,
             out,
             sample,
+            json,
+            stop_stdin,
+            stream,
             control_pipe,
             parent_pid,
         } => cmd_capture(
@@ -238,6 +255,9 @@ fn run() -> Result<()> {
             filter,
             out,
             sample,
+            json,
+            stop_stdin,
+            stream,
             control_pipe,
             parent_pid,
         ),
@@ -341,11 +361,14 @@ fn cmd_capture(
     no_children: bool,
     launch: Option<String>,
     monitor: Vec<String>,
-    duration: u64,
-    max_mb: usize,
+    duration: Option<u64>,
+    max_mb: Option<usize>,
     filter: Option<String>,
     out: Option<PathBuf>,
     sample: usize,
+    json: bool,
+    stop_stdin: bool,
+    worker_stream: bool,
     control_pipe: Option<String>,
     parent_pid: Option<u32>,
 ) -> Result<()> {
@@ -353,8 +376,10 @@ fn cmd_capture(
         std::env::temp_dir().join(format!("procmon-capture-{}.pml", std::process::id()))
     });
     let limits = core::CaptureLimits {
-        max_bytes: max_mb * 1024 * 1024,
-        duration: Some(std::time::Duration::from_secs(duration)),
+        max_bytes: max_mb
+            .map(|mib| mib.saturating_mul(1024 * 1024))
+            .unwrap_or(usize::MAX),
+        duration: duration.map(Duration::from_secs),
     };
 
     // The parsed spec is built ONLY for the paths that capture in-process. The
@@ -373,19 +398,28 @@ fn cmd_capture(
 
     // (a) Worker mode: an elevated child driven by an unelevated parent.
     if let Some(pipe) = control_pipe {
-        return run_capture_worker(build_spec(&filter)?, limits, &out_path, &pipe, parent_pid);
+        return run_capture_worker(
+            build_spec(&filter)?,
+            limits,
+            &out_path,
+            &pipe,
+            parent_pid,
+            worker_stream,
+        );
     }
 
-    // (b) Already elevated: capture in-process (current behavior).
+    let live_rows = !json;
+
+    // (b) Already elevated: capture in-process and stop gracefully on Ctrl-C.
     if elevate::is_elevated() {
-        let outcome = core::capture(make_loader(), build_spec(&filter)?, limits, &out_path)
-            .map_err(|e| anyhow::anyhow!(loader::describe_error(&e)))?;
-        return print_capture_result(
-            &outcome.pml_path,
-            outcome.events_written,
-            &outcome.stopped_reason,
-            sample,
-        );
+        let outcome = capture_in_process(
+            build_spec(&filter)?,
+            limits,
+            &out_path,
+            live_rows,
+            stop_stdin,
+        )?;
+        return finish_capture(&outcome, sample, json);
     }
 
     // (c) Unelevated: validate the filter early (avoid a wasted UAC prompt),
@@ -401,10 +435,85 @@ fn cmd_capture(
         max_mb,
         &out_path,
         filter.as_deref(),
-        /*background=*/ false,
+        live_rows,
     );
-    let outcome = orchestrate_one_shot(args, &out_path)?;
-    print_capture_result(&outcome.0, outcome.1, &outcome.2, sample)
+    let outcome = orchestrate_one_shot(args, &out_path, live_rows, duration.is_none(), stop_stdin)?;
+    finish_capture(
+        &core::CaptureOutcome {
+            pml_path: outcome.0,
+            events_written: outcome.1,
+            stopped_reason: outcome.2,
+        },
+        sample,
+        json,
+    )
+}
+
+fn capture_in_process(
+    spec: core::TargetSpec,
+    limits: core::CaptureLimits,
+    out_path: &std::path::Path,
+    live_rows: bool,
+    stop_stdin: bool,
+) -> Result<core::CaptureOutcome> {
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let handler_flag = Arc::clone(&interrupted);
+    ctrlc::set_handler(move || handler_flag.store(true, Ordering::SeqCst))
+        .context("install Ctrl-C handler")?;
+    if stop_stdin {
+        let stdin_flag = Arc::clone(&interrupted);
+        std::thread::spawn(move || {
+            if wait_for_stdin_stop() {
+                stdin_flag.store(true, Ordering::SeqCst);
+            }
+        });
+    }
+
+    if live_rows {
+        let (session, events) =
+            core::CaptureSession::start_streaming(make_loader(), spec, limits, out_path)
+                .map_err(|e| anyhow::anyhow!(loader::describe_error(&e)))?;
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        while session.is_running() && !interrupted.load(Ordering::SeqCst) {
+            match events.recv_timeout(Duration::from_millis(50)) {
+                Ok(ev) => stream::write_line(&mut out, &stream::format_event(&ev))?,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        let outcome = session
+            .stop()
+            .map_err(|e| anyhow::anyhow!(loader::describe_error(&e)))?;
+        for ev in events.try_iter() {
+            stream::write_line(&mut out, &stream::format_event(&ev))?;
+        }
+        Ok(outcome)
+    } else {
+        let session = core::CaptureSession::start(make_loader(), spec, limits, out_path)
+            .map_err(|e| anyhow::anyhow!(loader::describe_error(&e)))?;
+        while session.is_running() && !interrupted.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        session
+            .stop()
+            .map_err(|e| anyhow::anyhow!(loader::describe_error(&e)))
+    }
+}
+
+fn wait_for_stdin_stop() -> bool {
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match input.read_line(&mut line) {
+            Ok(0) => return true,
+            Ok(_) if line.trim().eq_ignore_ascii_case("stop") => return true,
+            Ok(_) => continue,
+            Err(_) => return false,
+        }
+    }
 }
 
 /// Worker mode: connect to the parent pipe, start the capture, run the control
@@ -415,16 +524,24 @@ fn run_capture_worker(
     out_path: &std::path::Path,
     pipe: &str,
     parent_pid: Option<u32>,
+    stream_events: bool,
 ) -> Result<()> {
     // parent_pid is reserved for an optional parent-liveness backup; pipe EOF
     // already covers parent death, so it is currently unused.
     let _ = parent_pid;
-    let session = core::CaptureSession::start(make_loader(), spec, limits, out_path)
-        .map_err(|e| anyhow::anyhow!(loader::describe_error(&e)))?;
     let (reader, mut writer) = orchestrate::connect_worker(pipe)?;
-
-    worker::run_worker(Box::new(session), reader, &mut writer)
-        .map_err(|e| anyhow::anyhow!("worker loop: {e}"))?;
+    if stream_events {
+        let (session, events) =
+            core::CaptureSession::start_streaming(make_loader(), spec, limits, out_path)
+                .map_err(|e| anyhow::anyhow!(loader::describe_error(&e)))?;
+        worker::run_worker(Box::new(session), reader, &mut writer, Some(&events))
+            .map_err(|e| anyhow::anyhow!("worker loop: {e}"))?;
+    } else {
+        let session = core::CaptureSession::start(make_loader(), spec, limits, out_path)
+            .map_err(|e| anyhow::anyhow!(loader::describe_error(&e)))?;
+        worker::run_worker(Box::new(session), reader, &mut writer, None)
+            .map_err(|e| anyhow::anyhow!("worker loop: {e}"))?;
+    }
     Ok(())
 }
 
@@ -436,16 +553,61 @@ fn run_capture_worker(
 fn orchestrate_one_shot(
     worker_argv: Vec<String>,
     out_path: &std::path::Path,
+    live_rows: bool,
+    manual_fallback: bool,
+    stop_stdin: bool,
 ) -> Result<(String, usize, core::StoppedReason)> {
     #[cfg(not(windows))]
     {
-        let _ = (worker_argv, out_path);
+        let _ = (
+            worker_argv,
+            out_path,
+            live_rows,
+            manual_fallback,
+            stop_stdin,
+        );
         anyhow::bail!("self-elevation is only supported on Windows");
     }
     #[cfg(windows)]
     {
         let mut link = orchestrate::launch_worker(&orchestrate::pipe_name(0), worker_argv)?;
-        let done = link.read_done()?;
+        let stopper = link.stopper();
+        let stop_sent = Arc::new(AtomicBool::new(false));
+        let handler_stop_sent = Arc::clone(&stop_sent);
+        ctrlc::set_handler(move || {
+            if !handler_stop_sent.swap(true, Ordering::SeqCst) {
+                let _ = stopper.send_stop();
+            }
+        })
+        .context("install Ctrl-C handler")?;
+        if stop_stdin {
+            let stdin_stopper = link.stopper();
+            let stdin_stop_sent = Arc::clone(&stop_sent);
+            std::thread::spawn(move || {
+                if wait_for_stdin_stop() && !stdin_stop_sent.swap(true, Ordering::SeqCst) {
+                    let _ = stdin_stopper.send_stop();
+                }
+            });
+        }
+
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        let done = loop {
+            match link.read_next()? {
+                Some(ipc::ChildMsg::Event { line }) => {
+                    if live_rows {
+                        stream::write_line(&mut out, &line)?;
+                    }
+                }
+                Some(ipc::ChildMsg::Done {
+                    events_written,
+                    stopped_reason,
+                    pml_path,
+                }) => break Some((events_written, stopped_reason, pml_path)),
+                Some(_) => continue,
+                None => break None,
+            }
+        };
         match done {
             Some((events, reason, pml_path)) => {
                 Ok((pml_path, events as usize, parse_stopped_reason(&reason)))
@@ -457,7 +619,11 @@ fn orchestrate_one_shot(
                 Ok((
                     out_path.to_string_lossy().into_owned(),
                     count,
-                    core::StoppedReason::Duration,
+                    if manual_fallback {
+                        core::StoppedReason::Manual
+                    } else {
+                        core::StoppedReason::Duration
+                    },
                 ))
             }
         }
@@ -469,6 +635,7 @@ fn parse_stopped_reason(s: &str) -> core::StoppedReason {
     match s {
         "Duration" => core::StoppedReason::Duration,
         "SizeLimit" => core::StoppedReason::SizeLimit,
+        "Disconnected" => core::StoppedReason::Disconnected,
         _ => core::StoppedReason::Manual,
     }
 }
@@ -484,11 +651,11 @@ pub(crate) fn build_worker_args(
     include_children: bool,
     launch: Option<&str>,
     monitor: &[String],
-    duration: u64,
-    max_mb: usize,
+    duration: Option<u64>,
+    max_mb: Option<usize>,
     out_path: &std::path::Path,
     filter: Option<&str>,
-    background: bool,
+    stream_events: bool,
 ) -> Vec<String> {
     let mut a = vec!["capture".to_string()];
     for n in names {
@@ -514,13 +681,19 @@ pub(crate) fn build_worker_args(
         a.push("--filter".into());
         a.push(f.to_string());
     }
-    // Background mode means "until stopped" — use a very large duration; the
-    // parent stops it via the pipe.
-    let secs = if background { u64::MAX / 2 } else { duration };
-    a.push("--duration".into());
-    a.push(secs.to_string());
-    a.push("--max-mb".into());
-    a.push(max_mb.to_string());
+    // Omitted limits stay omitted in the elevated worker, preserving an
+    // explicitly-stop-only capture.
+    if let Some(secs) = duration {
+        a.push("--duration".into());
+        a.push(secs.to_string());
+    }
+    if let Some(mib) = max_mb {
+        a.push("--max-mb".into());
+        a.push(mib.to_string());
+    }
+    if stream_events {
+        a.push("--stream".into());
+    }
     a.push("--out".into());
     a.push(out_path.to_string_lossy().into_owned());
     a.push("--parent-pid".into());
@@ -547,12 +720,29 @@ pub(crate) fn background_worker_args(
         include_children,
         launch,
         monitor,
-        /*duration ignored in background*/ 0,
-        max_mb,
+        None,
+        Some(max_mb),
         out_path,
         filter,
-        true,
+        false,
     )
+}
+
+fn finish_capture(outcome: &core::CaptureOutcome, sample: usize, json: bool) -> Result<()> {
+    if json {
+        print_capture_result(
+            &outcome.pml_path,
+            outcome.events_written,
+            &outcome.stopped_reason,
+            sample,
+        )
+    } else {
+        eprintln!(
+            "capture stopped ({:?}); {} events; PML: {}",
+            outcome.stopped_reason, outcome.events_written, outcome.pml_path
+        );
+        Ok(())
+    }
 }
 
 /// Re-opens the produced PML and prints the standard capture result JSON.

@@ -221,8 +221,13 @@ endpoints?") without flooding the model with raw events.
 ```bash
 cargo build -p procmon-cli --release
 
-# Capture a program + its children for 10s (live capture needs Administrator):
-procmon-cli capture --name app.exe --launch "app.exe" --duration 10
+# Stream process lifecycle events until Ctrl-C (live capture needs Administrator):
+procmon-cli capture --filter 'class = process and operation ~ Process'
+
+# Each stdout row is tab-separated:
+# date-time.ms  operation  pid  ppid  executable  working-directory  command-line
+# Add an optional bound, or request the original final JSON instead of live rows:
+procmon-cli capture --name app.exe --duration 10 --max-mb 512 --json
 
 # Analyze any .PML (no elevation needed). The filter is an
 # expression (&& / || / ! / in (...)); see `vocab` for the full syntax:
@@ -230,6 +235,17 @@ procmon-cli query --pml cap.pml --group-by Path \
   --filter 'Category == "File System" && Operation == WriteFile'
 procmon-cli vocab            # exact column/operator/operation names + syntax
 procmon-cli --help           # all subcommands
+```
+
+On Windows, Node's `child.kill('SIGTERM')` is a forceful termination and cannot
+run the capture finalizer. Supervisors should use the stdin stop protocol:
+
+```js
+const { spawn } = require('node:child_process');
+const child = spawn('procmon-cli.exe', ['capture', '--stop-stdin', '--filter',
+  'class = process and operation ~ Process']);
+// Later: graceful stop, flush remaining rows, finalize the PML, then exit.
+child.stdin.end('stop\n');
 ```
 
 Two ways to wire it to an agent:

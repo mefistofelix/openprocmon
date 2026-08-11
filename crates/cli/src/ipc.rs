@@ -21,6 +21,9 @@ pub enum ParentMsg {
 pub enum ChildMsg {
     /// Sent once the worker has connected and started capturing.
     Started { pml_path: String },
+    /// One already-formatted live event line for the unelevated parent to write
+    /// to its stdout.
+    Event { line: String },
     /// Periodic progress (best-effort).
     Status { events_written: u64 },
     /// Terminal: capture finalized. The worker exits right after sending this.
@@ -78,6 +81,13 @@ mod tests {
         .unwrap();
         write_msg(
             &mut buf,
+            &ChildMsg::Event {
+                line: "2026-08-11 17:00:00.000\tProcess Start\t42\t4".into(),
+            },
+        )
+        .unwrap();
+        write_msg(
+            &mut buf,
             &ChildMsg::Done {
                 events_written: 42,
                 stopped_reason: "Manual".into(),
@@ -89,6 +99,8 @@ mod tests {
         let mut r = std::io::BufReader::new(&buf[..]);
         let a: Option<ChildMsg> = read_msg(&mut r).unwrap();
         assert!(matches!(a, Some(ChildMsg::Started { .. })));
+        let event: Option<ChildMsg> = read_msg(&mut r).unwrap();
+        assert!(matches!(event, Some(ChildMsg::Event { .. })));
         let b: Option<ChildMsg> = read_msg(&mut r).unwrap();
         assert!(matches!(
             b,
