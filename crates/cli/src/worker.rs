@@ -37,6 +37,7 @@ pub fn run_worker<R, W>(
     reader: R,
     writer: &mut W,
     events: Option<&Receiver<Event>>,
+    stream_format: &crate::stream::StreamFormat,
 ) -> std::io::Result<CaptureOutcome>
 where
     R: BufRead + Send + 'static,
@@ -65,7 +66,7 @@ where
     // Wait for the capture to self-stop (duration/size) or the parent to signal,
     // forwarding accepted events as soon as the capture thread publishes them.
     while capturer.is_running() && !signalled.load(Ordering::SeqCst) {
-        if forward_events(events, writer).is_err() {
+        if forward_events(events, writer, stream_format).is_err() {
             // The parent side disappeared. Finalize the PML instead of leaving
             // the driver/session alive just because live forwarding failed.
             signalled.store(true, Ordering::SeqCst);
@@ -77,7 +78,7 @@ where
     let outcome = capturer.stop()?;
     // stop() joins the capture thread, so this final drain contains every event
     // that raced with the last polling iteration.
-    let _ = forward_events(events, writer);
+    let _ = forward_events(events, writer, stream_format);
     // Best-effort: if the parent died the pipe write fails, but the PML is saved.
     let _ = write_msg(
         writer,
@@ -93,17 +94,14 @@ where
 fn forward_events<W: Write>(
     events: Option<&Receiver<Event>>,
     writer: &mut W,
+    stream_format: &crate::stream::StreamFormat,
 ) -> std::io::Result<()> {
     let Some(events) = events else {
         return Ok(());
     };
     while let Ok(ev) = events.try_recv() {
-        write_msg(
-            writer,
-            &ChildMsg::Event {
-                line: crate::stream::format_event(&ev),
-            },
-        )?;
+        let line = stream_format.format_event(&ev)?;
+        write_msg(writer, &ChildMsg::Event { line })?;
     }
     Ok(())
 }
@@ -164,7 +162,7 @@ mod tests {
         // Parent sends a Stop line; capture is "running" until the signal.
         let reader = Cursor::new(b"{\"type\":\"stop\"}\n".to_vec());
         let mut out: Vec<u8> = Vec::new();
-        let outcome = run_worker(cap, reader, &mut out, None).unwrap();
+        let outcome = run_worker(cap, reader, &mut out, None, &Default::default()).unwrap();
         assert_eq!(outcome.events_written, 7);
         assert!(stopped.load(Ordering::SeqCst), "capturer was stopped");
         let text = String::from_utf8(out).unwrap();
@@ -178,7 +176,7 @@ mod tests {
         // Empty input == immediate EOF (parent exited before sending anything).
         let reader = Cursor::new(Vec::new());
         let mut out: Vec<u8> = Vec::new();
-        let outcome = run_worker(cap, reader, &mut out, None).unwrap();
+        let outcome = run_worker(cap, reader, &mut out, None, &Default::default()).unwrap();
         assert!(
             stopped.load(Ordering::SeqCst),
             "EOF still finalizes the PML"
@@ -193,7 +191,7 @@ mod tests {
         let (cap, stopped) = fake(false);
         let reader = Cursor::new(Vec::new());
         let mut out: Vec<u8> = Vec::new();
-        run_worker(cap, reader, &mut out, None).unwrap();
+        run_worker(cap, reader, &mut out, None, &Default::default()).unwrap();
         assert!(stopped.load(Ordering::SeqCst), "self-stop still finalizes");
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("\"type\":\"done\""));

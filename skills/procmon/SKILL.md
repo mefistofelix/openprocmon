@@ -4,16 +4,15 @@ description: >
   Capture and analyze Windows process / file / registry / network activity with
   OpenProcMon (procmon-cli). Use when investigating what a program does — files
   it writes, registry keys it touches, network it makes, its process tree and
-  call stacks — or when analyzing a Procmon-compatible .PML capture. The model:
-  a capture writes a .PML; every analysis reads one.
+  call stacks — either through live stdout or a Procmon-compatible .PML capture.
 ---
 
 # OpenProcMon (procmon-cli)
 
-OpenProcMon is a capture-then-analyze tool. A **capture** records process/file/
-registry/network events to a Procmon-compatible **`.PML`** file; every analysis
-command **reads a `.PML`** and prints JSON. The same `procmon-cli` binary also
-serves these as MCP tools (`procmon-cli mcp`).
+OpenProcMon streams live events as JSONL by default. `capture --json` records
+process/file/registry/network events to a Procmon-compatible **`.PML`** file and
+prints a final summary; every offline analysis command **reads a `.PML`**. The
+same `procmon-cli` binary also serves these as MCP tools (`procmon-cli mcp`).
 
 ## Prerequisites
 
@@ -32,7 +31,7 @@ serves these as MCP tools (`procmon-cli mcp`).
 Capture a program and all its children for 10s, launching it first:
 
 ```bash
-procmon-cli capture --name notepad.exe --launch "notepad.exe" --duration 10
+procmon-cli capture --name notepad.exe --launch "notepad.exe" --duration 10 --json
 ```
 
 - `--name X` (repeatable) targets a process by image name — matches **present and
@@ -47,8 +46,10 @@ procmon-cli capture --name notepad.exe --launch "notepad.exe" --duration 10
   malware (the payload may run inside an existing process, not a child), capture
   system-wide and filter afterward.
 
-`capture` prints the `pml_path`, a summary, and a sample of events. Re-analyze
-that `.PML` with the commands below.
+With `--json`, `capture` prints the `pml_path`, a summary, and a sample of events.
+Re-analyze that `.PML` with the commands below. Without `--json`, capture emits
+one flushed JSON object per event and creates no PML; `--fields pid,operation,...`
+selects ordered CSV columns with a full-precision timestamp prepended.
 
 ### 2. Query — the universal tool
 

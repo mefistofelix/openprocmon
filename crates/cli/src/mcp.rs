@@ -354,6 +354,7 @@ impl ProcmonServer {
                             std::path::Path::new(&out2),
                             filter.as_deref(),
                             false,
+                            &[],
                         );
                         let mut link = crate::orchestrate::launch_worker(
                             &crate::orchestrate::pipe_name(0),

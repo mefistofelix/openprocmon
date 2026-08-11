@@ -1,12 +1,10 @@
-//! Live capture: drive the driver, scope events, write a `.PML`.
+//! Live capture: drive the driver, scope events, and optionally write a `.PML`.
 //!
-//! A capture is "produce a PML": connect the driver, enable the requested
-//! sources, and relay events on a background thread. Each event passes the
-//! dynamic [`PidScope`] (the "who" block) and the static capture filter (the
-//! "what" block) before being written; the capture's own process is always
-//! excluded. Stops on a size cap, an optional duration, or an explicit stop —
-//! then finalizes the PML. Mirrors the GUI's `SdkSource` relay, but using
-//! `recv_timeout` so the stop is prompt and there is no blocking iterator.
+//! Connect the driver, enable requested sources, and relay events on a background
+//! thread. Each event passes the dynamic [`PidScope`] and static capture filter
+//! before publication and optional persistence; the capture's own process is
+//! always excluded. A capture stops on size, duration, disconnection, or an
+//! explicit request. The transient streaming path never allocates a PML writer.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -108,7 +106,7 @@ pub struct CaptureOutcome {
     pub stopped_reason: StoppedReason,
 }
 
-/// A running capture writing to a `.PML` on a background thread.
+/// A running background capture, with optional `.PML` persistence.
 pub struct CaptureSession {
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<Result<CaptureOutcome>>>,
@@ -125,7 +123,7 @@ impl CaptureSession {
         limits: CaptureLimits,
         out_path: impl Into<PathBuf>,
     ) -> Result<Self> {
-        Self::start_inner(loader, spec, limits, out_path.into(), None)
+        Self::start_inner(loader, spec, limits, out_path.into(), None, true)
     }
 
     /// Starts a capture and returns a receiver that yields every scoped,
@@ -139,7 +137,21 @@ impl CaptureSession {
         out_path: impl Into<PathBuf>,
     ) -> Result<(Self, crossbeam_channel::Receiver<Event>)> {
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
-        let session = Self::start_inner(loader, spec, limits, out_path.into(), Some(event_tx))?;
+        let session =
+            Self::start_inner(loader, spec, limits, out_path.into(), Some(event_tx), true)?;
+        Ok((session, event_rx))
+    }
+
+    /// Starts a filtered live stream without allocating a PML writer or creating
+    /// a file. This is the low-overhead path for line-oriented stdout consumers.
+    pub fn start_streaming_transient(
+        loader: DriverLoader,
+        spec: TargetSpec,
+        limits: CaptureLimits,
+    ) -> Result<(Self, crossbeam_channel::Receiver<Event>)> {
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        let session =
+            Self::start_inner(loader, spec, limits, PathBuf::new(), Some(event_tx), false)?;
         Ok((session, event_rx))
     }
 
@@ -149,6 +161,7 @@ impl CaptureSession {
         limits: CaptureLimits,
         out_path: PathBuf,
         event_tx: Option<crossbeam_channel::Sender<Event>>,
+        persist_pml: bool,
     ) -> Result<Self> {
         let mut controller = MonitorController::connect_with_driver(loader)?;
         if spec.monitors.contains(MonitorFlags::NETWORK) {
@@ -193,6 +206,7 @@ impl CaptureSession {
                     thread_stop,
                     thread_out,
                     event_tx,
+                    persist_pml,
                 )
             })
             .map_err(|e| procmon_sdk::Error::Parse(format!("spawn capture thread: {e}")))?;
@@ -285,13 +299,17 @@ fn run_capture(
     stop: Arc<AtomicBool>,
     out_path: PathBuf,
     event_tx: Option<crossbeam_channel::Sender<Event>>,
+    persist_pml: bool,
 ) -> Result<CaptureOutcome> {
     let own_pid = std::process::id();
-    let mut writer = PmlWriter::new(cfg!(target_pointer_width = "64"));
-    writer.stamp_host();
-    // Reuse the capture's module-version cache (pre-warmed from image-load
-    // events) so finalize doesn't block on thousands of version-resource reads.
-    writer.use_module_versions(Arc::clone(controller.metadata().module_versions()));
+    let mut writer = persist_pml.then(|| {
+        let mut writer = PmlWriter::new(cfg!(target_pointer_width = "64"));
+        writer.stamp_host();
+        // Reuse the capture's module-version cache (pre-warmed from image-load
+        // events) so finalize doesn't block on thousands of version reads.
+        writer.use_module_versions(Arc::clone(controller.metadata().module_versions()));
+        writer
+    });
     let mut bytes = 0usize;
     let mut written = 0usize;
     let start = Instant::now();
@@ -323,11 +341,13 @@ fn run_capture(
                     && filter.as_ref().is_none_or(|f| f.matches(&ev))
                 {
                     let event_bytes = ev.byte_size();
-                    writer.push_event(&ev);
+                    if let Some(writer) = &mut writer {
+                        writer.push_event(&ev);
+                    }
                     if let Some(tx) = &event_tx {
                         // An unbounded channel keeps stdout/IPC backpressure off
                         // the driver ingest thread. If the consumer disappeared,
-                        // capture and PML writing continue normally.
+                        // capture and optional PML writing continue normally.
                         let _ = tx.send(ev);
                     }
                     bytes = bytes.saturating_add(event_bytes);
@@ -342,13 +362,19 @@ fn run_capture(
     };
 
     controller.stop();
-    // Carry the full process table (pre-existing, event-silent processes
-    // included — their INIT seeds never surface as events) so parent chains
-    // survive when the PML is reopened.
-    writer.stamp_processes(controller.processes());
-    writer.finish_live_to_path(&out_path)?;
+    if let Some(mut writer) = writer {
+        // Carry the full process table (pre-existing, event-silent processes
+        // included — their INIT seeds never surface as events) so parent chains
+        // survive when the PML is reopened.
+        writer.stamp_processes(controller.processes());
+        writer.finish_live_to_path(&out_path)?;
+    }
     Ok(CaptureOutcome {
-        pml_path: out_path.to_string_lossy().into_owned(),
+        pml_path: if persist_pml {
+            out_path.to_string_lossy().into_owned()
+        } else {
+            String::new()
+        },
         events_written: written,
         stopped_reason: reason,
     })

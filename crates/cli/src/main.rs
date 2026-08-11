@@ -1,9 +1,9 @@
 //! `procmon-cli`: the command-line + MCP front-end for OpenProcMon.
 //!
-//! A capture-then-analyze tool: `capture` streams accepted events while writing
-//! a Procmon-compatible `.PML` (live, needs Administrator + driver); every other
-//! command reads a `.PML` and prints JSON — the same shape the MCP tools return.
-//! The one filter vocabulary (`vocab`) drives both capture and analysis queries.
+//! A capture-then-analyze tool: `capture` streams accepted events without a PML
+//! by default (live, needs Administrator + driver); `capture --json` preserves
+//! the capture-to-PML summary mode. Analysis commands read a `.PML` and print
+//! JSON. One filter vocabulary (`vocab`) drives capture and analysis queries.
 
 use std::io::BufRead;
 use std::path::PathBuf;
@@ -33,9 +33,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Capture activity to a .PML (live; needs Administrator). Targets are by
+    /// Capture live activity (needs Administrator). Targets are by
     /// process name (+ children) and/or pid; an optional command is launched
-    /// first. Streams one minimal tab-separated line per event until Ctrl-C.
+    /// first. Streams one flushed JSON object per event until Ctrl-C; --fields
+    /// selects CSV columns instead. Stdout mode does not create a PML.
     Capture {
         /// Target process name (repeatable). Empty = capture the whole system.
         #[arg(long = "name")]
@@ -66,7 +67,7 @@ enum Command {
         /// (&& / || / ! / in (...)). See `vocab`.
         #[arg(long = "filter")]
         filter: Option<String>,
-        /// Output .PML path (default: a temp file).
+        /// Output .PML path for --json mode (default: a temp file).
         #[arg(long)]
         out: Option<PathBuf>,
         /// Number of sample events to include with --json.
@@ -75,6 +76,11 @@ enum Command {
         /// Suppress live rows and print the original final JSON summary.
         #[arg(long)]
         json: bool,
+        /// CSV fields (comma-separated). Passing this switches live stdout from
+        /// JSONL to CSV; timestamp is always the first column. Field names and
+        /// aliases are case-insensitive (e.g. operation,pid,ppid,binpath,workdir,cmdline).
+        #[arg(long, value_delimiter = ',', conflicts_with = "json")]
+        fields: Vec<String>,
         /// Stop cleanly when stdin receives `stop` or reaches EOF (for Node and
         /// other process supervisors; Windows SIGTERM is forceful).
         #[arg(long = "stop-stdin")]
@@ -240,6 +246,7 @@ fn run() -> Result<()> {
             out,
             sample,
             json,
+            fields,
             stop_stdin,
             stream,
             control_pipe,
@@ -256,6 +263,7 @@ fn run() -> Result<()> {
             out,
             sample,
             json,
+            fields,
             stop_stdin,
             stream,
             control_pipe,
@@ -367,11 +375,18 @@ fn cmd_capture(
     out: Option<PathBuf>,
     sample: usize,
     json: bool,
+    fields: Vec<String>,
     stop_stdin: bool,
     worker_stream: bool,
     control_pipe: Option<String>,
     parent_pid: Option<u32>,
 ) -> Result<()> {
+    let stream_format = stream::StreamFormat::from_names(&fields).map_err(anyhow::Error::msg)?;
+    if !json && out.is_some() && control_pipe.is_none() {
+        anyhow::bail!(
+            "--out is only available with --json; live stdout mode does not create a PML"
+        );
+    }
     let out_path = out.unwrap_or_else(|| {
         std::env::temp_dir().join(format!("procmon-capture-{}.pml", std::process::id()))
     });
@@ -405,6 +420,7 @@ fn cmd_capture(
             &pipe,
             parent_pid,
             worker_stream,
+            &stream_format,
         );
     }
 
@@ -418,6 +434,7 @@ fn cmd_capture(
             &out_path,
             live_rows,
             stop_stdin,
+            &stream_format,
         )?;
         return finish_capture(&outcome, sample, json);
     }
@@ -436,8 +453,16 @@ fn cmd_capture(
         &out_path,
         filter.as_deref(),
         live_rows,
+        &fields,
     );
-    let outcome = orchestrate_one_shot(args, &out_path, live_rows, duration.is_none(), stop_stdin)?;
+    let outcome = orchestrate_one_shot(
+        args,
+        &out_path,
+        live_rows,
+        duration.is_none(),
+        stop_stdin,
+        &stream_format,
+    )?;
     finish_capture(
         &core::CaptureOutcome {
             pml_path: outcome.0,
@@ -455,6 +480,7 @@ fn capture_in_process(
     out_path: &std::path::Path,
     live_rows: bool,
     stop_stdin: bool,
+    stream_format: &stream::StreamFormat,
 ) -> Result<core::CaptureOutcome> {
     let interrupted = Arc::new(AtomicBool::new(false));
     let handler_flag = Arc::clone(&interrupted);
@@ -471,13 +497,19 @@ fn capture_in_process(
 
     if live_rows {
         let (session, events) =
-            core::CaptureSession::start_streaming(make_loader(), spec, limits, out_path)
+            core::CaptureSession::start_streaming_transient(make_loader(), spec, limits)
                 .map_err(|e| anyhow::anyhow!(loader::describe_error(&e)))?;
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
+        if let Some(header) = stream_format.header() {
+            stream::write_line(&mut out, &header)?;
+        }
         while session.is_running() && !interrupted.load(Ordering::SeqCst) {
             match events.recv_timeout(Duration::from_millis(50)) {
-                Ok(ev) => stream::write_line(&mut out, &stream::format_event(&ev))?,
+                Ok(ev) => {
+                    let line = stream_format.format_event(&ev)?;
+                    stream::write_line(&mut out, &line)?;
+                }
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
             }
@@ -486,7 +518,8 @@ fn capture_in_process(
             .stop()
             .map_err(|e| anyhow::anyhow!(loader::describe_error(&e)))?;
         for ev in events.try_iter() {
-            stream::write_line(&mut out, &stream::format_event(&ev))?;
+            let line = stream_format.format_event(&ev)?;
+            stream::write_line(&mut out, &line)?;
         }
         Ok(outcome)
     } else {
@@ -525,6 +558,7 @@ fn run_capture_worker(
     pipe: &str,
     parent_pid: Option<u32>,
     stream_events: bool,
+    stream_format: &stream::StreamFormat,
 ) -> Result<()> {
     // parent_pid is reserved for an optional parent-liveness backup; pipe EOF
     // already covers parent death, so it is currently unused.
@@ -532,14 +566,20 @@ fn run_capture_worker(
     let (reader, mut writer) = orchestrate::connect_worker(pipe)?;
     if stream_events {
         let (session, events) =
-            core::CaptureSession::start_streaming(make_loader(), spec, limits, out_path)
+            core::CaptureSession::start_streaming_transient(make_loader(), spec, limits)
                 .map_err(|e| anyhow::anyhow!(loader::describe_error(&e)))?;
-        worker::run_worker(Box::new(session), reader, &mut writer, Some(&events))
-            .map_err(|e| anyhow::anyhow!("worker loop: {e}"))?;
+        worker::run_worker(
+            Box::new(session),
+            reader,
+            &mut writer,
+            Some(&events),
+            stream_format,
+        )
+        .map_err(|e| anyhow::anyhow!("worker loop: {e}"))?;
     } else {
         let session = core::CaptureSession::start(make_loader(), spec, limits, out_path)
             .map_err(|e| anyhow::anyhow!(loader::describe_error(&e)))?;
-        worker::run_worker(Box::new(session), reader, &mut writer, None)
+        worker::run_worker(Box::new(session), reader, &mut writer, None, stream_format)
             .map_err(|e| anyhow::anyhow!("worker loop: {e}"))?;
     }
     Ok(())
@@ -556,6 +596,7 @@ fn orchestrate_one_shot(
     live_rows: bool,
     manual_fallback: bool,
     stop_stdin: bool,
+    stream_format: &stream::StreamFormat,
 ) -> Result<(String, usize, core::StoppedReason)> {
     #[cfg(not(windows))]
     {
@@ -565,6 +606,7 @@ fn orchestrate_one_shot(
             live_rows,
             manual_fallback,
             stop_stdin,
+            stream_format,
         );
         anyhow::bail!("self-elevation is only supported on Windows");
     }
@@ -592,10 +634,25 @@ fn orchestrate_one_shot(
 
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
+        let mut header_written = false;
         let done = loop {
             match link.read_next()? {
+                Some(ipc::ChildMsg::Started { .. }) => {
+                    if live_rows && !header_written {
+                        if let Some(header) = stream_format.header() {
+                            stream::write_line(&mut out, &header)?;
+                        }
+                        header_written = true;
+                    }
+                }
                 Some(ipc::ChildMsg::Event { line }) => {
                     if live_rows {
+                        if !header_written {
+                            if let Some(header) = stream_format.header() {
+                                stream::write_line(&mut out, &header)?;
+                            }
+                            header_written = true;
+                        }
                         stream::write_line(&mut out, &line)?;
                     }
                 }
@@ -613,7 +670,18 @@ fn orchestrate_one_shot(
                 Ok((pml_path, events as usize, parse_stopped_reason(&reason)))
             }
             None => {
-                // Worker exited without a Done; read the finalized PML.
+                if live_rows {
+                    return Ok((
+                        String::new(),
+                        0,
+                        if manual_fallback {
+                            core::StoppedReason::Manual
+                        } else {
+                            core::StoppedReason::Disconnected
+                        },
+                    ));
+                }
+                // Persistent worker exited without a Done; read the finalized PML.
                 let reader = core::open_pml(out_path)?;
                 let count = core::pml_info(&reader).event_count as usize;
                 Ok((
@@ -656,6 +724,7 @@ pub(crate) fn build_worker_args(
     out_path: &std::path::Path,
     filter: Option<&str>,
     stream_events: bool,
+    stream_fields: &[String],
 ) -> Vec<String> {
     let mut a = vec!["capture".to_string()];
     for n in names {
@@ -693,6 +762,10 @@ pub(crate) fn build_worker_args(
     }
     if stream_events {
         a.push("--stream".into());
+        if !stream_fields.is_empty() {
+            a.push("--fields".into());
+            a.push(stream_fields.join(","));
+        }
     }
     a.push("--out".into());
     a.push(out_path.to_string_lossy().into_owned());
@@ -725,6 +798,7 @@ pub(crate) fn background_worker_args(
         out_path,
         filter,
         false,
+        &[],
     )
 }
 
@@ -738,8 +812,8 @@ fn finish_capture(outcome: &core::CaptureOutcome, sample: usize, json: bool) -> 
         )
     } else {
         eprintln!(
-            "capture stopped ({:?}); {} events; PML: {}",
-            outcome.stopped_reason, outcome.events_written, outcome.pml_path
+            "capture stopped ({:?}); {} filtered events; no PML created",
+            outcome.stopped_reason, outcome.events_written
         );
         Ok(())
     }

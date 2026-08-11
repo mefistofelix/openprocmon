@@ -212,21 +212,27 @@ In the GUI, use **File ▸ Open** to load a `.PML`.
 
 ## MCP / Skill
 
-`procmon-cli` is a command-line and **MCP** front-end that lets an AI agent drive
-OpenProcMon is a capture-then-analyze tool: a capture writes a `.PML`, and every
-analysis reads one. The single `query` primitive (filter + group-by) answers the
+`procmon-cli` is a command-line and **MCP** front-end for OpenProcMon. It can
+stream live events directly or capture a `.PML`; every offline
+analysis reads a PML. The single `query` primitive (filter + group-by) answers the
 common questions ("what files did X write?", "registry persistence?", "network
 endpoints?") without flooding the model with raw events.
 
 ```bash
 cargo build -p procmon-cli --release
 
-# Stream process lifecycle events until Ctrl-C (live capture needs Administrator):
+# Stream one complete JSON object per event until Ctrl-C (live capture needs
+# Administrator). Every line is flushed immediately and no PML is created:
 procmon-cli capture --filter 'class = process and operation ~ Process'
 
-# Each stdout row is tab-separated:
-# date-time.ms  operation  pid  ppid  executable  working-directory  command-line
-# Add an optional bound, or request the original final JSON instead of live rows:
+# Selecting fields switches stdout to CSV. The full-precision (100 ns) timestamp
+# is always column zero; requested columns retain their order and missing values
+# are empty:
+procmon-cli capture --filter 'class = process and operation ~ Process' \
+  --fields operation,pid,parent_pid,image_path,working_directory,command_line
+
+# Add an optional bound. --json preserves the original capture-to-PML mode and
+# prints its final JSON summary; --out is intentionally limited to that mode:
 procmon-cli capture --name app.exe --duration 10 --max-mb 512 --json
 
 # Analyze any .PML (no elevation needed). The filter is an
